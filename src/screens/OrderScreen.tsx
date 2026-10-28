@@ -1,6 +1,7 @@
+import { usePreventRemove } from '@react-navigation/native';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
-import { useMemo } from 'react';
-import { SectionList, StyleSheet, Text, View } from 'react-native';
+import { useEffect, useMemo, useState } from 'react';
+import { Alert, SectionList, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Ionicons from 'react-native-vector-icons/Ionicons';
 import CartBar from '../components/CartBar';
@@ -11,39 +12,121 @@ import SectionHeader from '../components/SectionHeader';
 import { useRestaurant } from '../context/RestaurantContext';
 import { RootStackParamList } from '../navigation/types';
 import { colors, fontSizes, radius, spacing } from '../theme/colors';
+import { Dish, OrderItem } from '../types';
 import {
   calcSubtotal,
+  changeQuantity,
   countItems,
   groupDishesByCategory,
+  isSameItems,
 } from '../utils/order';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Order'>;
 
 export default function OrderScreen({ route, navigation }: Props) {
   const { tableNumber } = route.params;
-  const { dishes, getServingOrder, changeItemQuantity } = useRestaurant();
+  const { dishes, getServingOrder, saveOrderItems } = useRestaurant();
 
-  // Bàn đã có hoá đơn "Đang phục vụ" thì load lại đúng hoá đơn đó
+  // Bàn đã có hoá đơn "Đang phục vụ" thì load lại đúng items của hoá đơn đó
   const order = getServingOrder(tableNumber);
-  const sections = useMemo(() => groupDishesByCategory(dishes), [dishes]);
+  const [draftItems, setDraftItems] = useState<OrderItem[]>(
+    () => order?.items ?? [],
+  );
+  // Giỏ đã lưu gần nhất, dùng để biết có thay đổi chưa xác nhận hay không
+  const [savedItems, setSavedItems] = useState<OrderItem[]>(
+    () => order?.items ?? [],
+  );
+  const [leaving, setLeaving] = useState(false);
+  const dirty = !isSameItems(draftItems, savedItems);
 
+  const sections = useMemo(() => groupDishesByCategory(dishes), [dishes]);
   const quantities = useMemo(() => {
     const map: Record<string, number> = {};
-    order?.items.forEach(item => {
+    draftItems.forEach(item => {
       map[item.dishId] = item.quantity;
     });
     return map;
-  }, [order]);
+  }, [draftItems]);
 
-  const items = order?.items ?? [];
-  const subtotal = calcSubtotal(items, dishes);
-  const summary = items
+  const subtotal = calcSubtotal(draftItems, dishes);
+  const summary = draftItems
     .map(item => {
       const dish = dishes.find(d => d.id === item.dishId);
       return dish ? `${dish.name} x${item.quantity}` : '';
     })
     .filter(Boolean)
     .join(', ');
+
+  // Rời màn hình khi còn món chưa xác nhận -> hỏi lại
+  usePreventRemove(dirty && !leaving, ({ data }) => {
+    Alert.alert(
+      'Bỏ thay đổi?',
+      'Các món vừa chọn chưa được xác nhận. Bạn có muốn bỏ thay đổi?',
+      [
+        { text: 'Ở lại', style: 'cancel' },
+        {
+          text: 'Bỏ thay đổi',
+          style: 'destructive',
+          onPress: () => navigation.dispatch(data.action),
+        },
+      ],
+    );
+  });
+
+  // Sau khi xác nhận xong thì quay về Sơ đồ bàn
+  useEffect(() => {
+    if (leaving) {
+      navigation.goBack();
+    }
+  }, [leaving, navigation]);
+
+  const handleChange = (dish: Dish, delta: 1 | -1) => {
+    if (delta > 0 && !dish.available) {
+      return;
+    }
+    setDraftItems(prev => changeQuantity(prev, dish.id, delta));
+  };
+
+  const commit = async () => {
+    const orderId = await saveOrderItems(tableNumber, draftItems);
+    setSavedItems(draftItems);
+    return orderId;
+  };
+
+  const handleConfirm = () => {
+    if (!dirty) {
+      return;
+    }
+    if (draftItems.length === 0) {
+      Alert.alert(
+        'Huỷ hoá đơn?',
+        `Bàn ${tableNumber} không còn món nào. Hoá đơn sẽ bị huỷ và bàn trở về trạng thái trống.`,
+        [
+          { text: 'Không', style: 'cancel' },
+          {
+            text: 'Huỷ hoá đơn',
+            style: 'destructive',
+            onPress: async () => {
+              await commit();
+              setLeaving(true);
+            },
+          },
+        ],
+      );
+      return;
+    }
+    commit().then(() => setLeaving(true));
+  };
+
+  const handleCheckout = async () => {
+    if (draftItems.length === 0) {
+      return;
+    }
+    const orderId = dirty ? await commit() : order?.id ?? null;
+    if (orderId) {
+      navigation.navigate('Payment', { orderId });
+    }
+  };
 
   return (
     <SafeAreaView style={styles.container} edges={['left', 'right', 'bottom']}>
@@ -72,7 +155,7 @@ export default function OrderScreen({ route, navigation }: Props) {
           <Text style={styles.infoText} numberOfLines={1}>
             {order
               ? `Vào lúc ${order.createdAt}`
-              : 'Chọn món để mở hoá đơn mới'}
+              : 'Chọn món rồi bấm Xác nhận đặt món'}
           </Text>
         </View>
       </ScreenHeader>
@@ -89,8 +172,8 @@ export default function OrderScreen({ route, navigation }: Props) {
           <OrderDishRow
             dish={item}
             quantity={quantities[item.id] ?? 0}
-            onIncrease={() => changeItemQuantity(tableNumber, item.id, 1)}
-            onDecrease={() => changeItemQuantity(tableNumber, item.id, -1)}
+            onIncrease={() => handleChange(item, 1)}
+            onDecrease={() => handleChange(item, -1)}
           />
         )}
         ListEmptyComponent={
@@ -103,15 +186,14 @@ export default function OrderScreen({ route, navigation }: Props) {
 
       <CartBar
         tableNumber={tableNumber}
-        itemCount={countItems(items)}
+        itemCount={countItems(draftItems)}
         summary={summary}
         subtotal={subtotal}
-        disabled={items.length === 0}
-        onCheckout={() => {
-          if (order) {
-            navigation.navigate('Payment', { orderId: order.id });
-          }
-        }}
+        dirty={dirty}
+        confirmDisabled={!dirty}
+        checkoutDisabled={draftItems.length === 0}
+        onConfirm={handleConfirm}
+        onCheckout={handleCheckout}
       />
     </SafeAreaView>
   );

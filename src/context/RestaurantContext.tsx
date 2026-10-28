@@ -25,11 +25,10 @@ interface RestaurantContextValue {
   updateDish: (id: string, input: DishInput) => Promise<void>;
   setDishAvailable: (id: string, available: boolean) => Promise<void>;
   deleteDish: (id: string) => Promise<boolean>;
-  changeItemQuantity: (
+  saveOrderItems: (
     tableNumber: number,
-    dishId: string,
-    delta: 1 | -1,
-  ) => Promise<void>;
+    items: OrderItem[],
+  ) => Promise<string | null>;
   payOrder: (orderId: string) => Promise<boolean>;
 }
 
@@ -143,65 +142,44 @@ export function RestaurantProvider({ children }: { children: ReactNode }) {
     [commitDishes, isDishInServingOrder],
   );
 
-  // Mỗi bàn chỉ có 1 hoá đơn "Đang phục vụ":
-  // - chưa có hoá đơn + bấm [+] -> tạo hoá đơn mới
-  // - số lượng về 0 -> bỏ món khỏi items; items rỗng -> xoá hoá đơn
-  const changeItemQuantity = useCallback(
-    async (tableNumber: number, dishId: string, delta: 1 | -1) => {
+  // Lưu giỏ món khi bấm "Xác nhận đặt món". Mỗi bàn chỉ có 1 hoá đơn "Đang phục vụ":
+  // - bàn trống + có món -> tạo hoá đơn mới (createdAt = thời điểm xác nhận)
+  // - bàn đang phục vụ -> cập nhật items
+  // - giỏ rỗng -> xoá hoá đơn, bàn về trạng thái trống
+  // Trả về id hoá đơn (null nếu hoá đơn bị xoá / không tạo)
+  const saveOrderItems = useCallback(
+    async (tableNumber: number, items: OrderItem[]) => {
       const current = ordersRef.current;
-      const dish = dishesRef.current.find(d => d.id === dishId);
       const existing = current.find(
         o => isServing(o) && o.tableNumber === tableNumber,
       );
+      const cleaned = items.filter(item => item.quantity >= 1);
 
-      if (delta > 0 && (!dish || !dish.available)) {
-        return;
-      }
-
-      if (!existing) {
-        if (delta < 0) {
-          return;
+      if (cleaned.length === 0) {
+        if (existing) {
+          await commitOrders(current.filter(o => o.id !== existing.id));
         }
-        const newOrder: Order = {
-          id: generateId(),
-          tableNumber,
-          items: [{ dishId, quantity: 1 }],
-          status: ORDER_STATUS.SERVING,
-          createdAt: formatDateTime(new Date()),
-        };
-        await commitOrders([...current, newOrder]);
-        return;
+        return null;
       }
 
-      const target = existing.items.find(item => item.dishId === dishId);
-      let items: OrderItem[];
-      if (delta > 0) {
-        items = target
-          ? existing.items.map(item =>
-              item.dishId === dishId
-                ? { ...item, quantity: item.quantity + 1 }
-                : item,
-            )
-          : [...existing.items, { dishId, quantity: 1 }];
-      } else {
-        if (!target) {
-          return;
-        }
-        items =
-          target.quantity <= 1
-            ? existing.items.filter(item => item.dishId !== dishId)
-            : existing.items.map(item =>
-                item.dishId === dishId
-                  ? { ...item, quantity: item.quantity - 1 }
-                  : item,
-              );
+      if (existing) {
+        await commitOrders(
+          current.map(o =>
+            o.id === existing.id ? { ...o, items: cleaned } : o,
+          ),
+        );
+        return existing.id;
       }
 
-      const next =
-        items.length === 0
-          ? current.filter(o => o.id !== existing.id)
-          : current.map(o => (o.id === existing.id ? { ...o, items } : o));
-      await commitOrders(next);
+      const newOrder: Order = {
+        id: generateId(),
+        tableNumber,
+        items: cleaned,
+        status: ORDER_STATUS.SERVING,
+        createdAt: formatDateTime(new Date()),
+      };
+      await commitOrders([...current, newOrder]);
+      return newOrder.id;
     },
     [commitOrders],
   );
@@ -235,7 +213,7 @@ export function RestaurantProvider({ children }: { children: ReactNode }) {
       updateDish,
       setDishAvailable,
       deleteDish,
-      changeItemQuantity,
+      saveOrderItems,
       payOrder,
     }),
     [
@@ -250,7 +228,7 @@ export function RestaurantProvider({ children }: { children: ReactNode }) {
       updateDish,
       setDishAvailable,
       deleteDish,
-      changeItemQuantity,
+      saveOrderItems,
       payOrder,
     ],
   );
